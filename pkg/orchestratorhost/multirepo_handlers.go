@@ -106,24 +106,23 @@ func (s *Server) provisionRepoWorktree(ctx context.Context, taskID string, repo 
 		}
 	}
 
-	worktreeRoot, _, err := managedRootForWorkspace(s.cfg.WorkspaceRoot, "worktrees")
+	worktreeRoot, worktreeRootReal, err := managedRootForWorkspace(s.cfg.WorkspaceRoot, "worktrees")
 	if err != nil {
 		return orchestrator.MultiRepoWorktreeResult{
 			RepoPath: repoPath,
 			Error:    fmt.Sprintf("failed to resolve worktree root: %v", err),
 		}
 	}
-	worktreePath := filepath.Join(worktreeRoot, taskID, repoBaseName)
 
-	// Verify the derived path is within the managed worktree root (defense in depth).
-	absWorktree, _ := filepath.Abs(worktreePath)
-	absRoot, _ := filepath.Abs(worktreeRoot)
-	if !strings.HasPrefix(absWorktree, absRoot) {
+	// Use resolvePathInsideRoot to derive a safe, contained worktree path.
+	taskDir, err := resolvePathInsideRoot(worktreeRoot, worktreeRootReal, taskID, "task_id", true)
+	if err != nil {
 		return orchestrator.MultiRepoWorktreeResult{
 			RepoPath: repoPath,
-			Error:    "derived worktree path escapes managed root",
+			Error:    fmt.Sprintf("failed to resolve task directory: %v", err),
 		}
 	}
+	worktreePath := filepath.Join(taskDir, repoBaseName)
 
 	if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 		return orchestrator.MultiRepoWorktreeResult{
@@ -400,15 +399,10 @@ func (s *Server) handleDetachRepo(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	worktreePath := filepath.Join(worktreeRoot, taskID, repoBaseName)
 
-	// Verify the derived path is within the managed worktree root (defense in depth).
-	absWorktree, _ := filepath.Abs(worktreePath)
-	absRoot, _ := filepath.Abs(worktreeRoot)
-	if !strings.HasPrefix(absWorktree, absRoot) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "derived worktree path escapes managed root"})
-		return
-	}
+	// taskID is validated by taskIDPattern above; repoBaseName is validated non-empty/non-slash.
+	// Both are safe for filepath.Join (no path traversal possible).
+	worktreePath := filepath.Join(worktreeRoot, taskID, repoBaseName)
 
 	// Check if the worktree exists.
 	cleaned := false

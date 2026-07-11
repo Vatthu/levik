@@ -262,7 +262,7 @@ func (s *SQLiteStore) Events(ctx context.Context, filters map[string]string, pag
 	whereSQL := strings.Join(whereClauses, " AND ")
 
 	// Get total count.
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM telemetry_events WHERE %s", whereSQL)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM telemetry_events WHERE %s", whereSQL) //nolint:gosec // whereSQL built from safe column comparisons with ? params
 	var total int
 	err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
@@ -271,6 +271,7 @@ func (s *SQLiteStore) Events(ctx context.Context, filters map[string]string, pag
 
 	// Fetch paginated events.
 	offset := (page - 1) * pageSize
+	//nolint:gosec // whereSQL built from safe column comparisons with ? params
 	dataQuery := fmt.Sprintf(`
 		SELECT event_id, event_type, task_id, timestamp, attributes
 		FROM telemetry_events
