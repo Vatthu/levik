@@ -86,10 +86,10 @@ rules:
     routing: auto_approve
   - name: everything-else
     conditions: {}
-    routing: founder_review
+    routing: founder_review  # requires your approval
 ```
 
-This says: auto-approve documentation changes, ask me for everything else. You can make it as detailed as you want — by file type, risk level, number of files changed, etc.
+This says: auto-approve documentation changes, ask me for everything else. You can make it as detailed as you want — by file type, risk level, number of files changed, etc. Running `vikram onboard` generates a sensible default for you.
 
 **Q: How is this different from Copilot?**
 Copilot helps you write code line by line. Vikram writes entire features while you do something else. Different category.
@@ -101,7 +101,7 @@ Devin is cloud-hosted, closed source, and sends your code to their servers. Vikr
 It's as good as the AI models you give it. For complex architecture decisions, you still need to think. For implementation — writing the actual code, tests, and plumbing — that's where Vikram saves you hours every day.
 
 **Q: Can it work across multiple repos?**
-Yes. Up to 8 repos in one task. It coordinates changes so API contract modifications in one repo match the client updates in another.
+Yes. You can define tasks that span multiple repositories — for example, updating an API in your backend while adjusting the client in your frontend. Vikram coordinates the changes as one atomic unit.
 
 **Q: What if I disagree with what it built?**
 Reject it (one click, nothing changes), or say "change X instead" and it revises. You're always in control.
