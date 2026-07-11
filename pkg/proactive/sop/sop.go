@@ -13,7 +13,7 @@ import (
 	"github.com/Vatthu/vikram/pkg/tools"
 )
 
-// orchHealthOK returns true when the Python orchestrator's LangGraph
+// orchHealthOK returns true when the Python orchestrator's state machine
 // workflow is reachable over its Unix socket.
 func orchHealthOK(ctx context.Context) bool {
 	client := &http.Client{
@@ -74,7 +74,7 @@ func (o *Orchestrator) resolveAgentID(role string) string {
 
 // Run executes the SOP loop: Plan -> Code -> Test -> Review.
 // If the Python orchestrator is reachable via its Unix socket, the task is
-// delegated to the full LangGraph workflow.  Otherwise falls back to the
+// delegated to the full orchestrator workflow.  Otherwise falls back to the
 // Go-native SOP pipeline.
 func (o *Orchestrator) Run(ctx context.Context, task, channel, chatID, sessionKey string) error {
 	logger.InfoCF("sop", "Starting SOP loop for task", map[string]interface{}{
@@ -82,7 +82,7 @@ func (o *Orchestrator) Run(ctx context.Context, task, channel, chatID, sessionKe
 	})
 
 	// Check whether the Python orchestrator is available.  When it is running
-	// the LangGraph workflow provides checkpointing, lint guards, adversarial
+	// the orchestrator workflow provides checkpointing, lint guards, adversarial
 	// spec validation, and the full 30-node engineering pipeline.
 	if orchHealthOK(ctx) {
 		logger.InfoC("sop", "Python orchestrator reachable — delegating task")

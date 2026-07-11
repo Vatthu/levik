@@ -78,3 +78,6 @@ web/dist/
 .github/instructions/
 .github/copilot-instructions.md
 .claude/
+
+# Kiro specs (internal engineering process)
+.kiro/

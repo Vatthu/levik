@@ -504,7 +504,7 @@ type agentCheckpoint struct {
 
 // resumeIncompleteSessions scans for checkpoint files from a previous run
 // and logs them.  The actual resume happens when the orchestrator replays
-// the LangGraph workflow from its own checkpoints.
+// the orchestrator workflow from its own checkpoints.
 func resumeIncompleteSessions(workspaceRoot string) {
 	tasksDir := filepath.Join(workspaceRoot, "tasks")
 	entries, err := os.ReadDir(tasksDir)
