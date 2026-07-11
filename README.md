@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Go Version](https://img.shields.io/github/go-mod-go-version/Vatthu/vikram)](go.mod)
 
-[Install](#install) · [What is Vikram?](#what-is-vikram) · [How It Works](#how-it-works) · [Quick Start](#quick-start) · [Architecture](#architecture) · [Contributing](CONTRIBUTING.md)
+[Install](#install) · [What is Vikram?](#what-is-vikram) · [How It Works](#how-it-works) · [Quick Start](#quick-start) · [FAQ](FAQ.md) · [Architecture](#architecture) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
