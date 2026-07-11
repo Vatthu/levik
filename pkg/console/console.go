@@ -16,10 +16,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/Vatthu/vikram/pkg/config"
 	"github.com/Vatthu/vikram/pkg/logger"
 	"github.com/Vatthu/vikram/pkg/pairing"
+	"github.com/gorilla/websocket"
 )
 
 //go:embed templates/*
@@ -114,6 +114,7 @@ type ChannelChangedFunc func(name string)
 type Server struct {
 	config          Config
 	hub             *wsHub
+	progressHub     *ProgressHub
 	cfg             *config.Config
 	cfgPath         string
 	templates       *template.Template
@@ -127,6 +128,7 @@ type Server struct {
 	orchSocket      string
 	orchHTTPClient  *http.Client
 	orchBaseURL     string
+	archive         *Archive
 }
 
 // SetOnAgentChange wires a callback for runtime agent registration.
@@ -163,11 +165,13 @@ func NewServer(cfg Config, appCfg *config.Config, cfgPath string) *Server {
 	return &Server{
 		config:      cfg,
 		hub:         newWSHub(),
+		progressHub: NewProgressHub(),
 		cfg:         appCfg,
 		cfgPath:     cfgPath,
 		templates:   tmpl,
 		projectRoot: projectRoot,
 		orchSocket:  defaultOrchestratorSocket(),
+		archive:     NewArchive(),
 	}
 }
 
@@ -272,15 +276,35 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/config/mcp/{name}", s.auth(s.handleAPIMCPDelete))
 	// --- Tasks ---
 	mux.HandleFunc("/api/tasks", s.auth(s.handleAPITasks))
+	mux.HandleFunc("/api/tasks/batch", s.auth(s.handleBatchTasks))
 	mux.HandleFunc("/api/tasks/{task_id}/review", s.auth(s.handleAPITaskReview))
 	mux.HandleFunc("/api/tasks/{task_id}/resume", s.auth(s.handleAPITaskResume))
+	mux.HandleFunc("/api/tasks/{task_id}/diff", s.auth(s.handleAPITaskDiff))
+	mux.HandleFunc("/api/tasks/{task_id}/files", s.auth(s.handleAPITaskFiles))
+	mux.HandleFunc("/api/tasks/{task_id}/merge", s.auth(s.handleAPITaskMerge))
 	mux.HandleFunc("/api/orchestrator", s.auth(s.handleOrchStatus))
 	mux.HandleFunc("/api/orchestrator/start", s.auth(s.handleOrchStart))
 	mux.HandleFunc("/api/orchestrator/stop", s.auth(s.handleOrchStop))
 	mux.HandleFunc("/api/chat/send", s.auth(s.handleChatSend))
 	mux.HandleFunc("/api/telegram/pair", s.auth(s.handleTelegramPair))
+	// --- Archive ---
+	mux.HandleFunc("/api/archive", s.auth(s.handleArchiveSearch))
+	mux.HandleFunc("/api/archive/export", s.auth(s.handleArchiveExport))
+	// --- Cost Dashboard ---
+	mux.HandleFunc("/api/cost/overview", s.auth(s.handleAPICostOverview))
+	mux.HandleFunc("/api/cost/breakdown", s.auth(s.handleAPICostBreakdown))
+	// --- Formations ---
+	mux.HandleFunc("/api/formations", s.auth(s.handleAPIFormations))
+	mux.HandleFunc("/api/formations/ab-test", s.auth(s.handleAPIFormationABTest))
+	mux.HandleFunc("/api/formations/ab-test/promote", s.auth(s.handleAPIFormationABPromote))
+	mux.HandleFunc("/api/formations/{id}/clone", s.auth(s.handleAPIFormationClone))
+	mux.HandleFunc("/api/formations/{id}", s.auth(s.handleAPIFormationByID))
+	// --- Team Health ---
+	mux.HandleFunc("/api/team/health", s.auth(s.handleAPITeamHealth))
 	// --- Skills ---
 	mux.HandleFunc("/api/skills", s.auth(s.handleAPISkills))
+	// --- Console Progress (real-time) ---
+	s.RegisterConsoleRoutes(mux)
 	// Legacy HTML fragment routes
 	mux.HandleFunc("/agents", s.auth(s.handleAgents))
 	mux.HandleFunc("/agents/add", s.auth(s.handleAddAgent))
@@ -309,6 +333,9 @@ func (s *Server) Stop() {
 		s.orchCmd.Process.Kill()
 	}
 	s.orchMu.Unlock()
+	if s.progressHub != nil {
+		s.progressHub.Stop()
+	}
 	if s.httpSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
