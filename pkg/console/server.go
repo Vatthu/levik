@@ -63,11 +63,25 @@ type ProgressHub struct {
 	done       chan struct{}
 }
 
-// progressClient represents a connected WebSocket client for progress events.
+// progressClient is a connected WebSocket client receiving progress events.
 type progressClient struct {
-	send chan ConsoleEvent
-	// Optional filter: if empty, receives all events.
+	send       chan ConsoleEvent
+	mu         sync.RWMutex
 	taskFilter string
+}
+
+// setFilter updates the client's task filter (thread-safe).
+func (c *progressClient) setFilter(taskID string) {
+	c.mu.Lock()
+	c.taskFilter = taskID
+	c.mu.Unlock()
+}
+
+// getFilter retrieves the client's task filter (thread-safe).
+func (c *progressClient) getFilter() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.taskFilter
 }
 
 // NewProgressHub creates and starts a new ProgressHub for real-time event delivery.
@@ -103,7 +117,7 @@ func (h *ProgressHub) run() {
 			h.mu.RLock()
 			for client := range h.clients {
 				// Apply task filter if set
-				if client.taskFilter != "" && client.taskFilter != event.TaskID {
+				if f := client.getFilter(); f != "" && f != event.TaskID {
 					continue
 				}
 				select {

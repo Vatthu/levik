@@ -102,7 +102,7 @@ func (s *Server) handleConsoleWS(w http.ResponseWriter, r *http.Request) {
 				FilterTask string `json:"filter_task"`
 			}
 			if json.Unmarshal(message, &sub) == nil && sub.FilterTask != "" {
-				client.taskFilter = sub.FilterTask
+				client.setFilter(sub.FilterTask)
 			}
 		}
 	}()

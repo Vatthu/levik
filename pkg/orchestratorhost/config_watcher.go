@@ -117,17 +117,21 @@ func (cw *ConfigWatcher) Start(ctx context.Context) error {
 // Stop halts the config watcher and releases resources.
 func (cw *ConfigWatcher) Stop() {
 	cw.mu.Lock()
-	defer cw.mu.Unlock()
-
 	if cw.cancel != nil {
 		cw.cancel()
 		cw.cancel = nil
 	}
+	cw.mu.Unlock()
+
+	// Wait for the loop goroutine to exit before closing the watcher.
+	<-cw.done
+
+	cw.mu.Lock()
 	if cw.watcher != nil {
 		cw.watcher.Close()
 		cw.watcher = nil
 	}
-	<-cw.done
+	cw.mu.Unlock()
 }
 
 // loop is the main event loop that processes filesystem events.

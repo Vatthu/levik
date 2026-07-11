@@ -81,6 +81,14 @@ func (s *Server) handleMultiRepoProvision(w http.ResponseWriter, r *http.Request
 // provisionRepoWorktree provisions a single repository worktree within the task's
 // workspace area. Each repo is placed at worktrees/{task_id}/{repo_basename}.
 func (s *Server) provisionRepoWorktree(ctx context.Context, taskID string, repo orchestrator.RepoRef) orchestrator.MultiRepoWorktreeResult {
+	// Validate taskID format to prevent path traversal (also validated by caller).
+	if !taskIDPattern.MatchString(taskID) {
+		return orchestrator.MultiRepoWorktreeResult{
+			RepoPath: repo.Path,
+			Error:    "task_id contains unsupported characters",
+		}
+	}
+
 	repoPath, err := validatedGitRepositoryPath(s.cfg.WorkspaceRoot, repo.Path)
 	if err != nil {
 		return orchestrator.MultiRepoWorktreeResult{
@@ -106,6 +114,16 @@ func (s *Server) provisionRepoWorktree(ctx context.Context, taskID string, repo 
 		}
 	}
 	worktreePath := filepath.Join(worktreeRoot, taskID, repoBaseName)
+
+	// Verify the derived path is within the managed worktree root (defense in depth).
+	absWorktree, _ := filepath.Abs(worktreePath)
+	absRoot, _ := filepath.Abs(worktreeRoot)
+	if !strings.HasPrefix(absWorktree, absRoot) {
+		return orchestrator.MultiRepoWorktreeResult{
+			RepoPath: repoPath,
+			Error:    "derived worktree path escapes managed root",
+		}
+	}
 
 	if err := os.MkdirAll(filepath.Dir(worktreePath), 0o755); err != nil {
 		return orchestrator.MultiRepoWorktreeResult{
@@ -383,6 +401,14 @@ func (s *Server) handleDetachRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	worktreePath := filepath.Join(worktreeRoot, taskID, repoBaseName)
+
+	// Verify the derived path is within the managed worktree root (defense in depth).
+	absWorktree, _ := filepath.Abs(worktreePath)
+	absRoot, _ := filepath.Abs(worktreeRoot)
+	if !strings.HasPrefix(absWorktree, absRoot) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "derived worktree path escapes managed root"})
+		return
+	}
 
 	// Check if the worktree exists.
 	cleaned := false

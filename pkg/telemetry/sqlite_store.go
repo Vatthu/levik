@@ -176,6 +176,8 @@ func (s *SQLiteStore) queryGrouped(ctx context.Context, q SummaryQuery) (Summary
 
 	// For simplicity, use first group_by field for grouping.
 	// Multi-level grouping would require recursive queries.
+	// The group_by values are validated above via switch — only allowlisted column names are used.
+	//nolint:gosec // G201: group_by fields are validated via switch above
 	query := fmt.Sprintf(`
 		SELECT
 			%s,
