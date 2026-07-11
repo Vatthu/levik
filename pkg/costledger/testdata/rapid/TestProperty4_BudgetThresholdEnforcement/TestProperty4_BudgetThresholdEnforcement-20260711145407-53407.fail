@@ -1,0 +1,24 @@
+# 2026/07/11 14:54:07.606434 [TestProperty4_BudgetThresholdEnforcement] [rapid] draw maxCostUSD: 1
+# 2026/07/11 14:54:07.606571 [TestProperty4_BudgetThresholdEnforcement] [rapid] draw numRecords: 3
+# 2026/07/11 14:54:07.606950 [TestProperty4_BudgetThresholdEnforcement] 
+# 	Error Trace:	/Users/ashok/projects/Vatthu/vikram/pkg/costledger/budget_property_test.go:111
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:458
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:467
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:292
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:207
+# 	            				/Users/ashok/projects/Vatthu/vikram/pkg/costledger/budget_property_test.go:24
+# 	Error:      	Should be true
+# 	Test:       	TestProperty4_BudgetThresholdEnforcement
+# 	Messages:   	circuit breaker must activate when cumulative (1.2000) >= max_cost_usd (1.0000)
+# 
+v0.4.8#16630670399214766974
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0

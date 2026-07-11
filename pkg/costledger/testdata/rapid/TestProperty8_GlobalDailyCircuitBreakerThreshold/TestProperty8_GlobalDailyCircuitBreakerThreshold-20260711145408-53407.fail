@@ -1,0 +1,28 @@
+# 2026/07/11 14:54:08.309722 [TestProperty8_GlobalDailyCircuitBreakerThreshold] [rapid] draw dailyCeiling: 8.0625
+# 2026/07/11 14:54:08.310024 [TestProperty8_GlobalDailyCircuitBreakerThreshold] [rapid] draw numTasks: 2
+# 2026/07/11 14:54:08.310026 [TestProperty8_GlobalDailyCircuitBreakerThreshold] [rapid] draw numRecordsPerTask: 3
+# 2026/07/11 14:54:08.310623 [TestProperty8_GlobalDailyCircuitBreakerThreshold] 
+# 	Error Trace:	/Users/ashok/projects/Vatthu/vikram/pkg/costledger/budget_property_test.go:351
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:458
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:467
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:292
+# 	            				/Users/ashok/go/pkg/mod/pgregory.net/rapid@v1.3.0/engine.go:207
+# 	            				/Users/ashok/projects/Vatthu/vikram/pkg/costledger/budget_property_test.go:278
+# 	Error:      	"8.062499998" is not greater than or equal to "8.0625"
+# 	Test:       	TestProperty8_GlobalDailyCircuitBreakerThreshold
+# 	Messages:   	daily total must be >= ceiling when breach detected
+# 
+v0.4.8#10737822154734825118
+0x0
+0x0
+0x0
+0x1
+0x0
+0x4
+0x200000000000
+0x0
+0x0
+0x1
+0x0
+0x0
+0x1
