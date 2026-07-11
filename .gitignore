@@ -84,3 +84,10 @@ web/dist/
 
 # Local scripts (release checks, utilities)
 scripts/
+
+# Research and archive (internal reference material)
+research/
+archive/
+
+# Agent instruction files
+CLAUDE.md

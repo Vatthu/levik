@@ -1396,7 +1396,7 @@ func apiBaseFromConfig(cfg *config.Config, providerID string) string {
 //     without overwriting anything the user previously set.
 //  3. Re-sync workspace templates (skipping files that already exist).
 //
-// Equivalent to nanobot's "N" (keep) path in onboard. Run it after upgrading
+// Preserves existing workspace state during upgrade. Run after installing a new version.
 // vikram to get new config fields without re-running the full wizard.
 func onboardRefresh() {
 	configPath := getConfigPath()
