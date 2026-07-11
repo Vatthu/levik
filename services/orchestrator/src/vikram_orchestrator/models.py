@@ -372,6 +372,11 @@ class TaskCreateRequest(BaseModel):
     constraints: TaskConstraints = Field(default_factory=TaskConstraints)
     operator_channel: str | None = None
     operator_chat_id: str | None = None
+    # Multi-repo and scheduling extensions (Requirements 21.1, 16.1, 18.1, 14.2)
+    repos: list[RepoRef] = Field(default_factory=list)
+    priority: str = "normal"  # "critical", "high", "normal", "low"
+    depends_on: list[str] = Field(default_factory=list)
+    formation: str | None = None
 
 
 class TaskChangeRequest(BaseModel):
@@ -558,3 +563,62 @@ class BrowserTestResponse(BaseModel):
     exit_code: int
     output: str
     screenshot: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Multi-Repo Merge Models (Requirements 24.3, 24.4)
+# ---------------------------------------------------------------------------
+
+
+class GitMergeRequest(BaseModel):
+    """Request to merge a worktree branch into its target branch via fast-forward."""
+
+    task_id: str
+    worktree_path: str
+    target_branch: str
+    source_branch: str
+
+
+class GitMergeResponse(BaseModel):
+    """Response from a git merge operation."""
+
+    task_id: str
+    worktree_path: str
+    success: bool
+    head_ref: str = ""
+    error: str = ""
+
+
+class AtomicMultiRepoMergeRequest(BaseModel):
+    """Request for atomic merge of multiple repos with rollback on failure.
+
+    Validates: Requirements 24.3, 24.4
+    """
+
+    task_id: str
+    repos: list[GitMergeRequest] = Field(default_factory=list)
+
+
+class AtomicMultiRepoMergeResponse(BaseModel):
+    """Response from an atomic multi-repo merge attempt.
+
+    If any repo merge fails, all previously merged repos are rolled back.
+    """
+
+    task_id: str
+    success: bool
+    merged_repos: list[str] = Field(default_factory=list)
+    failed_repo: str = ""
+    failure_error: str = ""
+    rolled_back_repos: list[str] = Field(default_factory=list)
+
+
+class VerificationCommandResult(BaseModel):
+    """Result of running a verification command in a specific repo's worktree."""
+
+    repo_path: str
+    command: str
+    success: bool
+    exit_code: int = 0
+    output: str = ""
+    error_output: str = ""

@@ -11,6 +11,7 @@ dependencies = [
   "langgraph-checkpoint-sqlite==3.0.3",
   "pydantic==2.13.3",
   "pydantic-settings==2.14.0",
+  "pyyaml>=6.0",
   "uvicorn==0.46.0",
 ]
 

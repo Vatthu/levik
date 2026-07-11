@@ -7,6 +7,10 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from vikram_orchestrator.models import (
+    AgentProfile,
+    AgentRosterResponse,
+    AgentThinkRequest,
+    AgentThinkResponse,
     ApprovalDecision,
     ArtifactReadRequest,
     ArtifactReadResponse,
@@ -71,6 +75,87 @@ class StubHostClient:
             restrict_to_workspace=True,
             sandboxed=False,
             telegram_enabled=True,
+        )
+
+    def agent_roster(self) -> AgentRosterResponse:
+        return AgentRosterResponse(
+            agents=[
+                AgentProfile(
+                    id="lead-1",
+                    role="lead",
+                    name="Lead Agent",
+                    provider="openai",
+                    model="gpt-4",
+                    capabilities=["planning", "review"],
+                ),
+                AgentProfile(
+                    id="engineer-1",
+                    role="engineer",
+                    name="Engineer Agent",
+                    provider="openai",
+                    model="gpt-4",
+                    capabilities=["implementation", "code"],
+                ),
+                AgentProfile(
+                    id="qa-1",
+                    role="qa",
+                    name="QA Agent",
+                    provider="openai",
+                    model="gpt-4",
+                    capabilities=["testing", "qa"],
+                ),
+            ]
+        )
+
+    def agent_think(self, request: AgentThinkRequest) -> AgentThinkResponse:
+        role = request.role
+        if role == "lead":
+            content = (
+                "## Implementation Plan\n\n"
+                "1. Open pkg/orchestratorhost/server.go\n"
+                "2. Add the new endpoint handler\n"
+                "3. Register the route in the router\n"
+                "4. Run go test ./pkg/orchestratorhost to verify\n"
+            )
+        elif role == "engineer":
+            content = (
+                '[{"path": "README.md", "old_text": "# Vikram", '
+                '"new_text": "# Vikram\\nTest", "rationale": "test change"}]'
+            )
+        elif role == "reviewer":
+            content = "CONCEDE - the plan is solid and covers all necessary steps."
+        elif role == "qa":
+            content = '{"verdict": "PASSED", "summary": "All checks pass", "issues": []}'
+        else:
+            content = f'{{"verdict": "PASSED", "summary": "Agent {role} completed", "issues": []}}'
+        return AgentThinkResponse(
+            task_id=request.task_id,
+            role=role,
+            content=content,
+        )
+
+    def agent_think(self, request: AgentThinkRequest) -> AgentThinkResponse:
+        role = request.role
+        if role == "lead":
+            content = (
+                "## Implementation Plan\n\n"
+                "1. Modify workflow.py to add retry logic\n"
+                "2. Update settings.py with configuration\n"
+                "3. Add error types to team.py\n"
+                "4. Verify changes with tests\n"
+            )
+        elif role == "reviewer":
+            content = "CONCEDE"
+        elif role == "runner":
+            content = '{"verdict": "PASSED", "summary": "All checks passed", "issues": []}'
+        elif role == "qa":
+            content = '{"verdict": "PASSED", "summary": "QA checks passed", "issues": []}'
+        else:
+            content = f"Agent response for role: {role}"
+        return AgentThinkResponse(
+            task_id=request.task_id,
+            role=role,
+            content=content,
         )
 
     def provision_workspace(

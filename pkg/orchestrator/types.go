@@ -568,6 +568,84 @@ func (c InvocationContext) WithState(key, value string) InvocationContext {
 	return c
 }
 
+// MultiRepoProvisionRequest asks the host daemon to provision worktrees for
+// multiple repositories under a single task workspace root.
+type MultiRepoProvisionRequest struct {
+	TaskID string    `json:"task_id"`
+	Repos  []RepoRef `json:"repos"`
+}
+
+// MultiRepoWorktreeResult describes the provisioned worktree for one repository
+// within a multi-repo task.
+type MultiRepoWorktreeResult struct {
+	RepoPath     string `json:"repo_path"`
+	WorktreePath string `json:"worktree_path"`
+	Branch       string `json:"branch"`
+	HeadRef      string `json:"head_ref,omitempty"`
+	Created      bool   `json:"created"`
+	Error        string `json:"error,omitempty"`
+}
+
+// MultiRepoProvisionResponse returns provisioned worktree paths for all repos.
+type MultiRepoProvisionResponse struct {
+	TaskID       string                    `json:"task_id"`
+	TaskRoot     string                    `json:"task_root"`
+	ArtifactsDir string                    `json:"artifacts_dir"`
+	LogsDir      string                    `json:"logs_dir"`
+	ScratchDir   string                    `json:"scratch_dir"`
+	Worktrees    []MultiRepoWorktreeResult `json:"worktrees"`
+}
+
+// AtomicMergeRequest asks the host daemon to perform sequential fast-forward
+// merges across multiple repositories with rollback on any failure.
+type AtomicMergeRequest struct {
+	TaskID string             `json:"task_id"`
+	Repos  []AtomicMergeEntry `json:"repos"`
+}
+
+// AtomicMergeEntry describes one repository merge within an atomic multi-repo merge.
+type AtomicMergeEntry struct {
+	RepoPath     string `json:"repo_path"`
+	WorktreePath string `json:"worktree_path"`
+	Branch       string `json:"branch"`
+	TargetBranch string `json:"target_branch"`
+}
+
+// AtomicMergeResult describes the outcome of merging one repository.
+type AtomicMergeResult struct {
+	RepoPath     string `json:"repo_path"`
+	Merged       bool   `json:"merged"`
+	RolledBack   bool   `json:"rolled_back"`
+	PreMergeRef  string `json:"pre_merge_ref,omitempty"`
+	PostMergeRef string `json:"post_merge_ref,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// AtomicMergeResponse reports the result of an atomic multi-repo merge.
+type AtomicMergeResponse struct {
+	TaskID   string              `json:"task_id"`
+	Success  bool                `json:"success"`
+	Results  []AtomicMergeResult `json:"results"`
+	FailedAt string              `json:"failed_at,omitempty"`
+}
+
+// DetachRepoRequest asks the host daemon to detach a blocked repository from
+// a multi-repo task, allowing remaining repos to proceed independently.
+type DetachRepoRequest struct {
+	TaskID   string `json:"task_id"`
+	RepoPath string `json:"repo_path"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// DetachRepoResponse reports the result of detaching a repository.
+type DetachRepoResponse struct {
+	TaskID       string `json:"task_id"`
+	RepoPath     string `json:"repo_path"`
+	Detached     bool   `json:"detached"`
+	WorktreePath string `json:"worktree_path,omitempty"`
+	Cleaned      bool   `json:"cleaned"`
+}
+
 // BrowserTestRequest asks the host daemon to run a browser test using Playwright.
 type BrowserTestRequest struct {
 	TaskID       string `json:"task_id"`
@@ -583,4 +661,50 @@ type BrowserTestResponse struct {
 	ExitCode   int    `json:"exit_code"`
 	Output     string `json:"output"`
 	Screenshot string `json:"screenshot,omitempty"` // base64 PNG
+}
+
+// ---------------------------------------------------------------------------
+// Extended Task Create (Requirements 14.2, 16.1, 17.1, 21.1)
+// ---------------------------------------------------------------------------
+
+// TaskCreateRequest is the extended task creation payload that includes
+// multi-repo, priority, dependency, and formation fields for the scheduler.
+type TaskCreateRequest struct {
+	TaskID          string          `json:"task_id"`
+	Source          string          `json:"source,omitempty"`
+	RequestedBy     string          `json:"requested_by,omitempty"`
+	Objective       string          `json:"objective"`
+	Repo            RepoRef         `json:"repo"`
+	Constraints     TaskConstraints `json:"constraints"`
+	OperatorChannel string          `json:"operator_channel,omitempty"`
+	OperatorChatID  string          `json:"operator_chat_id,omitempty"`
+	// Scheduler extensions
+	Repos     []RepoRef `json:"repos,omitempty"`
+	Priority  string    `json:"priority,omitempty"` // "critical", "high", "normal", "low"
+	DependsOn []string  `json:"depends_on,omitempty"`
+	Formation string    `json:"formation,omitempty"`
+}
+
+// PriorityUpdateRequest is the payload for PUT /v1/tasks/{task_id}/priority.
+type PriorityUpdateRequest struct {
+	Priority string `json:"priority"` // "critical", "high", "normal", "low"
+}
+
+// QueueEntry represents a single task in the scheduler queue response.
+type QueueEntry struct {
+	TaskID     string   `json:"task_id"`
+	Priority   string   `json:"priority"`
+	Status     string   `json:"status"`
+	EnqueuedAt float64  `json:"enqueued_at"`
+	DependsOn  []string `json:"depends_on,omitempty"`
+	Repos      []string `json:"repos,omitempty"`
+	Formation  string   `json:"formation,omitempty"`
+}
+
+// QueueResponse is the response for GET /v1/queue.
+type QueueResponse struct {
+	Queue   []QueueEntry `json:"queue"`
+	Running int          `json:"running"`
+	Queued  int          `json:"queued"`
+	Blocked int          `json:"blocked"`
 }

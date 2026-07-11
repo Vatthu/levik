@@ -20,8 +20,10 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Vatthu/vikram/pkg/costledger"
 	"github.com/Vatthu/vikram/pkg/logger"
 	"github.com/Vatthu/vikram/pkg/orchestrator"
+	"github.com/Vatthu/vikram/pkg/telemetry"
 	"github.com/Vatthu/vikram/pkg/tools"
 )
 
@@ -69,16 +71,34 @@ type Config struct {
 	ReviewChange        ReviewFunc // optional LLM judge integration
 	AgentThink          ThinkFunc  // optional per-role LLM reasoning
 	AgentRoster         []orchestrator.AgentProfile
+	TelemetryStore      telemetry.Store          // optional telemetry event store
+	TelemetryStream     *telemetry.StreamHandler // optional WebSocket stream handler
 }
 
 // Server exposes the host daemon capability surface over a Unix domain socket.
 type Server struct {
-	cfg        Config
-	notifier   notifier
-	execTool   execTool
-	httpServer *http.Server
-	listener   net.Listener
-	mu         sync.Mutex
+	cfg             Config
+	notifier        notifier
+	execTool        execTool
+	ledger          costLedger
+	traceVerifier   *telemetry.TraceVerifier
+	formationStore  formationStore
+	knowledgeStore  knowledgeStore
+	lockRegistry    lockRegistry
+	auditStore      auditStore
+	configWatcher   *ConfigWatcher
+	shutdownManager *ShutdownManager
+	httpServer      *http.Server
+	listener        net.Listener
+	mu              sync.Mutex
+}
+
+// costLedger is the subset of costledger.Ledger used by the host server.
+type costLedger interface {
+	Record(ctx context.Context, rec costledger.CostRecord) error
+	TaskCumulative(ctx context.Context, taskID string) (float64, error)
+	DailyTotal(ctx context.Context) (float64, error)
+	Forecast(ctx context.Context, complexity string, targetFiles int) (costledger.CostForecast, error)
 }
 
 // NewServer builds a host capability server around the current Vikram runtime.
@@ -88,6 +108,36 @@ func NewServer(cfg Config, notifier notifier) *Server {
 		notifier: notifier,
 		execTool: tools.NewExecToolForWorkspace(cfg.WorkspaceRoot, cfg.RestrictToWorkspace, cfg.Sandboxed, nil),
 	}
+}
+
+// SetLedger configures the cost ledger used by the host server for cost
+// recording and budget queries. Must be called before Start.
+func (s *Server) SetLedger(l costLedger) {
+	s.ledger = l
+}
+
+// SetTraceVerifier configures the execution trace verifier for hash chain
+// integrity checks. Must be called before Start.
+func (s *Server) SetTraceVerifier(tv *telemetry.TraceVerifier) {
+	s.traceVerifier = tv
+}
+
+// SetLockRegistry configures the file-level lock registry for resource
+// contention management. Must be called before Start.
+func (s *Server) SetLockRegistry(lr lockRegistry) {
+	s.lockRegistry = lr
+}
+
+// SetAuditStore configures the approval audit store for querying audit records.
+// Must be called before Start.
+func (s *Server) SetAuditStore(as auditStore) {
+	s.auditStore = as
+}
+
+// SetConfigWatcher configures the filesystem config watcher for hot-reload.
+// Must be called before Start.
+func (s *Server) SetConfigWatcher(cw *ConfigWatcher) {
+	s.configWatcher = cw
 }
 
 func (s *Server) handler() http.Handler {
@@ -114,6 +164,38 @@ func (s *Server) handler() http.Handler {
 	mux.HandleFunc("/v1/repos/discover-lint", s.handleDiscoverLint)
 	mux.HandleFunc("/v1/repos/run-lint", s.handleRunLint)
 	mux.HandleFunc("/v1/browser/test", s.handleBrowserTest)
+	mux.HandleFunc("/v1/telemetry/emit", s.handleTelemetryEmit)
+	mux.HandleFunc("/v1/telemetry/summary", s.handleTelemetrySummary)
+	mux.HandleFunc("/v1/telemetry/events", s.handleTelemetryEvents)
+	mux.HandleFunc("/v1/telemetry/cost", s.handleTelemetryCost)
+	if s.cfg.TelemetryStream != nil {
+		mux.Handle("/v1/telemetry/stream", s.cfg.TelemetryStream)
+	}
+	mux.HandleFunc("POST /v1/cost/record", s.handleCostRecord)
+	mux.HandleFunc("GET /v1/cost/task/{task_id}", s.handleCostTaskCumulative)
+	mux.HandleFunc("POST /v1/cost/forecast", s.handleCostForecast)
+	mux.HandleFunc("GET /v1/cost/daily", s.handleCostDaily)
+	mux.HandleFunc("GET /v1/trace/query", s.handleTraceQuery)
+	mux.HandleFunc("POST /v1/trace/replay", s.handleTraceReplay)
+	mux.HandleFunc("GET /v1/models/performance", s.handleModelPerformance)
+	mux.HandleFunc("GET /v1/formations/effectiveness", s.handleFormationEffectiveness)
+	mux.HandleFunc("GET /v1/formations", s.handleFormations)
+	mux.HandleFunc("POST /v1/formations", s.handleFormations)
+	mux.HandleFunc("PUT /v1/formations/{name}", s.handleFormationByName)
+	mux.HandleFunc("DELETE /v1/formations/{name}", s.handleFormationByName)
+	mux.HandleFunc("POST /v1/locks/acquire", s.handleLockAcquire)
+	mux.HandleFunc("POST /v1/locks/release", s.handleLockRelease)
+	mux.HandleFunc("GET /v1/locks", s.handleLockQuery)
+	mux.HandleFunc("GET /v1/approvals/audit", s.handleApprovalsAudit)
+	mux.HandleFunc("GET /v1/knowledge/approaches", s.handleKnowledgeApproaches)
+	mux.HandleFunc("GET /v1/knowledge/failures", s.handleKnowledgeFailures)
+	mux.HandleFunc("POST /v1/workspaces/provision-multi", s.handleMultiRepoProvision)
+	mux.HandleFunc("POST /v1/tasks/{task_id}/merge-atomic", s.handleAtomicMerge)
+	mux.HandleFunc("POST /v1/tasks/{task_id}/detach-repo", s.handleDetachRepo)
+	// Scheduler endpoints (Requirements 16.4, 18.1, 19.3)
+	mux.HandleFunc("POST /v1/tasks", s.handleSchedulerCreateTask)
+	mux.HandleFunc("PUT /v1/tasks/{task_id}/priority", s.handleUpdateTaskPriority)
+	mux.HandleFunc("GET /v1/queue", s.handleGetQueue)
 	return mux
 }
 
@@ -145,7 +227,7 @@ func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	s.listener = listener
 	s.httpServer = &http.Server{
-		Handler:      s.handler(),
+		Handler:      s.handlerWithDrain(),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -864,7 +946,10 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		args["working_dir"] = req.WorkingDir
 	}
 
+	execStart := time.Now().UTC()
 	result := s.execTool.Execute(r.Context(), tools.ToolContext{}, args)
+	execDuration := time.Since(execStart)
+
 	state := map[string]interface{}{}
 	if req.WorkingDir != "" {
 		state["working_dir"] = req.WorkingDir
@@ -890,6 +975,29 @@ func (s *Server) handleExec(w http.ResponseWriter, r *http.Request) {
 		exitCode := int(*result.ExitCode)
 		obs.ExitCode = &exitCode
 	}
+
+	// Emit host_action telemetry event.
+	if s.cfg.TelemetryStore != nil {
+		actionAttrs := map[string]interface{}{
+			"action_name": req.ActionName,
+			"duration_ms": execDuration.Milliseconds(),
+			"success":     !result.IsError,
+		}
+		if result.ExitCode != nil {
+			actionAttrs["exit_code"] = int(*result.ExitCode)
+		}
+		if len(result.ForLLM) > 0 {
+			actionAttrs["bytes_transferred"] = len(result.ForLLM)
+		}
+		actionEvent := telemetry.TelemetryEvent{
+			EventType:  telemetry.EventHostAction,
+			TaskID:     req.TaskID,
+			Timestamp:  time.Now().UTC(),
+			Attributes: actionAttrs,
+		}
+		_ = s.cfg.TelemetryStore.Emit(r.Context(), actionEvent)
+	}
+
 	writeJSON(w, http.StatusOK, obs)
 }
 
@@ -1188,11 +1296,73 @@ func (s *Server) handleAgentThink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Emit agent_call_start telemetry event.
+	startTime := time.Now().UTC()
+	if s.cfg.TelemetryStore != nil {
+		startEvent := telemetry.TelemetryEvent{
+			EventType: telemetry.EventAgentCallStart,
+			TaskID:    req.TaskID,
+			Timestamp: startTime,
+			Attributes: map[string]interface{}{
+				"role":     req.Role,
+				"model":    req.Model,
+				"provider": req.ProviderName,
+			},
+		}
+		_ = s.cfg.TelemetryStore.Emit(r.Context(), startEvent)
+	}
+
 	resp, err := s.cfg.AgentThink(r.Context(), req)
+
+	// Emit agent_call_end telemetry event.
+	if s.cfg.TelemetryStore != nil {
+		endTime := time.Now().UTC()
+		latencyMS := endTime.Sub(startTime).Milliseconds()
+		endAttrs := map[string]interface{}{
+			"role":       req.Role,
+			"model":      req.Model,
+			"provider":   req.ProviderName,
+			"latency_ms": latencyMS,
+			"success":    err == nil,
+		}
+		if err != nil {
+			endAttrs["error"] = err.Error()
+		}
+		endEvent := telemetry.TelemetryEvent{
+			EventType:  telemetry.EventAgentCallEnd,
+			TaskID:     req.TaskID,
+			Timestamp:  endTime,
+			Attributes: endAttrs,
+		}
+		_ = s.cfg.TelemetryStore.Emit(r.Context(), endEvent)
+	}
+
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": fmt.Sprintf("agent think failed: %v", err)})
 		return
 	}
+
+	// Record cost via the ledger after each successful provider call.
+	if s.ledger != nil {
+		durationMS := time.Since(startTime).Milliseconds()
+		rec := costledger.CostRecord{
+			RecordID:     fmt.Sprintf("%s-%s-%d", req.TaskID, req.Role, startTime.UnixNano()),
+			TaskID:       req.TaskID,
+			Role:         req.Role,
+			Model:        req.Model,
+			Provider:     req.ProviderName,
+			InputTokens:  len(req.Prompt) / 4, // approximate token count
+			OutputTokens: len(resp.Content) / 4,
+			CostUSD:      0, // actual cost computed by pricing table or set by provider
+			Estimated:    true,
+			DurationMS:   durationMS,
+			InvocationID: fmt.Sprintf("%s-%s-%d", req.TaskID, req.Role, startTime.UnixNano()),
+			Timestamp:    startTime,
+		}
+		// Best-effort: do not fail the think response on ledger errors.
+		_ = s.ledger.Record(r.Context(), rec)
+	}
+
 	writeJSON(w, http.StatusOK, resp)
 }
 

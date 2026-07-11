@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import difflib
+import logging
+import re
 import sqlite3
+import time
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, Send, interrupt
 
+from .approval_matrix import ApprovalMatrix
+from .conflict_detector import ConflictDetector
+from .cost_client import CostClient, CostRecordRequest
+from .execution_trace import ExecutionTrace
 from .host_client import HostClient
+from .knowledge_store import KnowledgeStore
+from .model_router import ComplexitySignals, ModelRouter
 from .models import (
     ActionTransition,
+    AgentThinkRequest,
     GitRollbackRequest,
     ChangeReviewRequest,
     LintDiscoveryRequest,
@@ -44,8 +54,13 @@ from .models import (
     MergeAssessment,
 )
 from .policy import decide_approval_policy
+from .scheduler import Scheduler
 from .settings import settings
-from .team import TeamRouter
+from .team import AgentCallFailedError, AgentUnavailableError, TeamRouter
+from .telemetry_client import TelemetryClient
+from .verification_protocol import VerificationProtocol
+
+logger = logging.getLogger(__name__)
 
 
 class OrchestratorState(TypedDict, total=False):
@@ -564,8 +579,47 @@ def build_diff_preview(old_text: str, new_text: str, limit_lines: int = 18) -> s
     return "\n".join(diff_lines)
 
 
+def is_valid_plan(plan: str) -> bool:
+    """Check if a plan has substantive content worthy of adversarial validation.
+
+    A valid plan must:
+    - Not be empty/whitespace
+    - Have at least settings.plan_min_lines lines of content
+    - Not consist entirely of error messages
+    """
+    stripped = plan.strip()
+    if not stripped:
+        return False
+
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    if len(lines) < settings.plan_min_lines:
+        return False
+
+    # Check if plan consists entirely of error patterns
+    error_patterns = re.compile(
+        r"^(plan )?(unavailable|failed|error|timeout|unreachable|not configured)",
+        re.IGNORECASE,
+    )
+    # If ALL non-empty lines match error patterns, it's not a valid plan
+    if all(error_patterns.match(line.strip()) for line in lines):
+        return False
+
+    return True
+
+
 def build_graph(
-    host_client: HostClient, checkpoint_db: Path | None = None
+    host_client: HostClient,
+    checkpoint_db: Path | None = None,
+    *,
+    model_router: ModelRouter | None = None,
+    cost_client: CostClient | None = None,
+    telemetry_client: TelemetryClient | None = None,
+    execution_trace: ExecutionTrace | None = None,
+    approval_matrix: ApprovalMatrix | None = None,
+    conflict_detector: ConflictDetector | None = None,
+    knowledge_store: KnowledgeStore | None = None,
+    verification_protocol: VerificationProtocol | None = None,
+    scheduler: Scheduler | None = None,
 ):
     checkpoint_path = checkpoint_db or settings.checkpoint_db
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -574,8 +628,238 @@ def build_graph(
 
     def ask_agent(state: OrchestratorState, role: str, prompt: str):
         router = TeamRouter.from_state(state.get("team_roster", []))
-        request = router.request(task_id=state["task_id"], role=role, prompt=prompt)
-        return host_client.agent_think(request)
+        task_id = state["task_id"]
+        phase = state.get("phase", "unknown")
+
+        # --- Cost Client: budget check before agent call (Requirement 3.2) ---
+        if cost_client:
+            try:
+                remaining = cost_client.get_phase_remaining(task_id, phase)
+                if remaining <= 0:
+                    raise AgentCallFailedError(
+                        role=role,
+                        attempts=0,
+                        last_error=RuntimeError(
+                            f"Budget exhausted for phase '{phase}' (remaining={remaining:.4f} USD)"
+                        ),
+                    )
+            except AgentCallFailedError:
+                raise
+            except Exception:
+                # Budget service unavailable — proceed (fail-open for cost)
+                pass
+
+        # --- Model Router: select model if configured (Requirement 1.1) ---
+        model_selection = None
+        if model_router and cost_client:
+            try:
+                budget_position = 1.0
+                max_cost = state.get("max_cost_usd")
+                if max_cost and max_cost > 0:
+                    cumulative = cost_client.get_task_cost(task_id)
+                    budget_position = max(0.0, (max_cost - cumulative) / max_cost)
+
+                # Classify complexity from available signals
+                target_count = len(state.get("target_candidates", []) or [])
+                signals = ComplexitySignals(
+                    objective_scope=state.get("objective", ""),
+                    target_file_count=max(target_count, 1),
+                    repo_size_files=len(state.get("repo_top_level_entries", []) or []),
+                    language_count=1,
+                    change_type="logic",
+                    security_relevant=False,
+                    test_modification=False,
+                )
+                tier = model_router.classify_complexity(signals)
+                model_selection = model_router.select_model(
+                    task_id=task_id,
+                    role=role,
+                    tier=tier,
+                    budget_position=budget_position,
+                )
+            except Exception:
+                # Router unavailable — fall back to team roster selection
+                pass
+
+        request = router.request(task_id=task_id, role=role, prompt=prompt)
+
+        # Override provider/model if Model Router made a selection
+        if model_selection:
+            request = AgentThinkRequest(
+                task_id=request.task_id,
+                role=request.role,
+                prompt=request.prompt,
+                provider=model_selection.provider,
+                model=model_selection.model,
+            )
+
+        # --- Execution Trace: record model selection decision (Requirement 6.1) ---
+        if execution_trace and model_selection:
+            try:
+                execution_trace.record_decision(
+                    task_id=task_id,
+                    decision_type="model_selection",
+                    state_snapshot={
+                        "role": role,
+                        "phase": phase,
+                        "model": model_selection.model,
+                        "provider": model_selection.provider,
+                        "tier": model_selection.tier.value,
+                        "downgraded": model_selection.downgraded,
+                        "budget_remaining_pct": model_selection.budget_remaining_pct,
+                    },
+                    policy="model_router.select_model",
+                    outcome=model_selection.reason,
+                )
+            except Exception:
+                pass
+
+        # --- Telemetry: emit agent_call_start (Requirement 8.3) ---
+        call_start_time = time.time()
+        if telemetry_client:
+            try:
+                telemetry_client.emit_event(
+                    event_type="agent_call_start",
+                    task_id=task_id,
+                    attributes={"role": role, "phase": phase, "model": request.model or ""},
+                )
+            except Exception:
+                pass
+
+        last_error: Exception | None = None
+        for attempt in range(settings.agent_retry_count):
+            try:
+                result = host_client.agent_think(request)
+                # --- Telemetry: emit agent_call_end ---
+                if telemetry_client:
+                    try:
+                        telemetry_client.emit_event(
+                            event_type="agent_call_end",
+                            task_id=task_id,
+                            attributes={
+                                "role": role,
+                                "phase": phase,
+                                "model": request.model or "",
+                                "duration_ms": int((time.time() - call_start_time) * 1000),
+                                "success": True,
+                            },
+                        )
+                    except Exception:
+                        pass
+
+                # --- Cost Client: record cost event ---
+                if cost_client:
+                    try:
+                        cost_client.record_cost(CostRecordRequest(
+                            task_id=task_id,
+                            role=role,
+                            model=request.model or "",
+                            provider=request.provider or "",
+                            work_phase=phase,
+                            input_tokens=getattr(result, "input_tokens", 0) or 0,
+                            output_tokens=getattr(result, "output_tokens", 0) or 0,
+                            cost_usd=getattr(result, "cost_usd", 0.0) or 0.0,
+                            duration_ms=int((time.time() - call_start_time) * 1000),
+                        ))
+                    except Exception:
+                        pass
+
+                # --- Model Router: record outcome ---
+                if model_router and model_selection:
+                    try:
+                        model_router.record_outcome(
+                            model=model_selection.model,
+                            role=role,
+                            tier=model_selection.tier,
+                            outcome="success",
+                        )
+                    except Exception:
+                        pass
+
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt < settings.agent_retry_count - 1:
+                    time.sleep(settings.agent_retry_backoff_seconds * (2 ** attempt))
+
+        # --- Telemetry: emit agent_call_end with failure ---
+        if telemetry_client:
+            try:
+                telemetry_client.emit_event(
+                    event_type="agent_call_end",
+                    task_id=task_id,
+                    attributes={
+                        "role": role,
+                        "phase": phase,
+                        "model": request.model or "",
+                        "duration_ms": int((time.time() - call_start_time) * 1000),
+                        "success": False,
+                        "error": str(last_error)[:200] if last_error else "",
+                    },
+                )
+            except Exception:
+                pass
+
+        # --- Model Router: record failure ---
+        if model_router and model_selection:
+            try:
+                model_router.record_outcome(
+                    model=model_selection.model,
+                    role=role,
+                    tier=model_selection.tier,
+                    outcome="failure",
+                )
+            except Exception:
+                pass
+
+        # Primary role exhausted, try fallback
+        try:
+            fallback_agent = router.select_with_fallback(role, [])
+            fallback_request = AgentThinkRequest(
+                task_id=state["task_id"],
+                role=fallback_agent.role,
+                prompt=prompt,
+                provider=fallback_agent.provider,
+                model=fallback_agent.model,
+            )
+            return host_client.agent_think(fallback_request)
+        except (AgentUnavailableError, Exception):
+            pass
+
+        raise AgentCallFailedError(
+            role=role,
+            attempts=settings.agent_retry_count,
+            last_error=last_error,
+        )
+
+    def _emit_phase_transition(
+        state: OrchestratorState, to_phase: str, reason: str
+    ) -> None:
+        """Emit telemetry and record execution trace for phase transitions."""
+        task_id = state.get("task_id", "")
+        from_phase = state.get("phase", "unknown")
+        if telemetry_client and task_id:
+            try:
+                telemetry_client.emit_phase_transition(
+                    task_id=task_id,
+                    from_phase=from_phase,
+                    to_phase=to_phase,
+                    reason=reason,
+                )
+            except Exception:
+                pass
+        if execution_trace and task_id:
+            try:
+                execution_trace.record_decision(
+                    task_id=task_id,
+                    decision_type="phase_transition",
+                    state_snapshot={"from_phase": from_phase, "to_phase": to_phase},
+                    policy="workflow_state_machine",
+                    outcome=to_phase,
+                    nd_inputs={"reason": reason},
+                )
+            except Exception:
+                pass
 
     def notify_operator_state(
         state: OrchestratorState, operator_state: str, content: str
@@ -613,6 +897,7 @@ def build_graph(
 
     def verify_host(state: OrchestratorState) -> OrchestratorState:
         health = host_client.health()
+        _emit_phase_transition(state, "host_ready", "host_health_check_passed")
         return {
             **state,
             "status": "running",
@@ -631,8 +916,11 @@ def build_graph(
         except Exception as exc:
             return {
                 **state,
+                "status": "failed",
+                "phase": "team_unavailable",
                 "team_roster": [],
                 "team_router_summary": f"Team roster unavailable: {exc}",
+                "summary": f"Team discovery failed: {exc}",
             }
 
         agents = [agent.model_dump() for agent in roster.agents]
@@ -789,6 +1077,8 @@ def build_graph(
         objective = str(state.get("objective", ""))
         targets = state.get("target_candidates", [])
         previews = state.get("target_file_previews", [])
+        task_id = state["task_id"]
+        repo_path = state.get("repo_path", "")
 
         target_summary = "\n".join(
             f"{t.get('path', '')} (score: {t.get('score', 0)}, reason: {t.get('reason', '')})"
@@ -799,6 +1089,64 @@ def build_graph(
             for p in previews[:3]
         )
 
+        # --- Knowledge Store: inject repo context into planning (Requirement 38.3) ---
+        knowledge_context = ""
+        if knowledge_store and repo_path:
+            try:
+                compressed = knowledge_store.get_compressed_context(
+                    repo_path=repo_path,
+                    objective=objective,
+                    max_tokens=2000,
+                )
+                parts: list[str] = []
+                if compressed.module_graph:
+                    parts.append("Module dependencies: " + "; ".join(
+                        f"{k}->{','.join(v)}" for k, v in list(compressed.module_graph.items())[:10]
+                    ))
+                if compressed.interface_summaries:
+                    parts.append("Key interfaces:\n" + "\n".join(
+                        f"  {fp}: {summary[:120]}"
+                        for fp, summary in list(compressed.interface_summaries.items())[:5]
+                    ))
+                # Also inject failure warnings
+                warnings = knowledge_store.get_failure_warnings(repo_path, {"objective": objective})
+                if warnings:
+                    parts.append("Known pitfalls:\n" + "\n".join(
+                        f"  - {w.failure_class}: {w.error_signature[:100]}"
+                        for w in warnings[:3]
+                    ))
+                if parts:
+                    knowledge_context = "\n\nREPOSITORY KNOWLEDGE:\n" + "\n".join(parts)
+            except Exception:
+                pass
+
+        # --- Conflict Detector: check for conflicts at planning entry (Requirement 35.1) ---
+        conflict_warning = ""
+        if conflict_detector and repo_path:
+            try:
+                # Get active tasks from scheduler if available
+                active_tasks_targets: dict[str, list[str]] = {}
+                if scheduler:
+                    for entry in scheduler.get_queue():
+                        if entry.status == "running" and entry.task_id != task_id:
+                            active_tasks_targets[entry.task_id] = entry.repos
+                if active_tasks_targets:
+                    target_paths = [str(t.get("path", "")) for t in targets if t.get("path")]
+                    conflicts = conflict_detector.predict_conflicts(
+                        new_task_id=task_id,
+                        new_task_targets=target_paths or [repo_path],
+                        active_tasks=active_tasks_targets,
+                    )
+                    if conflicts:
+                        conflict_warning = "\n\nCONFLICT WARNING: Predicted overlaps with running tasks:\n" + "\n".join(
+                            f"  - {c.path} (probability={c.conflict_probability:.0%}, tasks: {c.task_a_id} vs {c.task_b_id})"
+                            for c in conflicts[:5]
+                        )
+            except Exception:
+                pass
+
+        _emit_phase_transition(state, "planning", "agent_plan_start")
+
         prompt = f"""You are the lead engineer. Analyze this task and create a concrete implementation plan.
 
 TASK: {objective}
@@ -807,7 +1155,7 @@ RELEVANT FILES:
 {target_summary}
 
 FILE CONTENTS (preview):
-{file_content}
+{file_content}{knowledge_context}{conflict_warning}
 
 Produce a plan with:
 1. What files need to change and why
@@ -817,12 +1165,8 @@ Produce a plan with:
 
 Keep it specific and actionable. Each step should reference exact file paths."""
 
-        plan_content = "Plan unavailable (lead agent not configured)"
-        try:
-            resp = ask_agent(state, "lead", prompt)
-            plan_content = resp.content
-        except Exception as exc:
-            plan_content = f"Plan unavailable: {exc}"
+        resp = ask_agent(state, "lead", prompt)
+        plan_content = resp.content
 
         return {
             **state,
@@ -835,8 +1179,15 @@ Keep it specific and actionable. Each step should reference exact file paths."""
         """Adversarial spec validation: Devil's Advocate attacks the plan, lead revises."""
         plan = str(state.get("plan_content", ""))
         objective = str(state.get("objective", ""))
-        if not plan or "unavailable" in plan.lower():
-            return {**state, "grill_rounds": 0, "grill_summary": "Skipped (no lead plan)"}
+        if not is_valid_plan(plan):
+            return {
+                **state,
+                "grill_rounds": 0,
+                "grill_summary": "Plan quality gate failed",
+                "status": "failed",
+                "phase": "planning_failed",
+                "summary": "Plan quality gate: content is empty, too short, or consists of error messages",
+            }
 
         max_rounds = 3
         critique_history: list[str] = []
@@ -855,12 +1206,7 @@ PLAN TO ATTACK:
 
 Find: architectural flaws, missing edge cases, security concerns, impossible assumptions, scope creep, or risky shortcuts. Be specific — cite exact parts of the plan. If the plan is solid, say CONCEDE."""
 
-            attack = "Devil's Advocate unavailable"
-            try:
-                resp = ask_agent(state, "reviewer", attack_prompt)
-                attack = resp.content
-            except Exception:
-                pass
+            attack = ask_agent(state, "reviewer", attack_prompt).content
 
             if "CONCEDE" in attack.upper():
                 revised_plan += f"\n\n[Round {round_num}: Devil's Advocate conceded — plan accepted]"
@@ -881,11 +1227,7 @@ CRITIQUE TO ADDRESS:
 
 Revise the plan to address all VALID criticisms. Ignore invalid or nitpicking critiques. Produce the complete revised plan (not a diff)."""
 
-            try:
-                resp = ask_agent(state, "lead", revise_prompt)
-                revised_plan = resp.content
-            except Exception:
-                pass
+            revised_plan = ask_agent(state, "lead", revise_prompt).content
 
         return {
             **state,
@@ -1083,13 +1425,36 @@ Revise the plan to address all VALID criticisms. Ignore invalid or nitpicking cr
             "verification_artifact_path": artifact.path,
         }
 
+    def route_after_discover_team(state: OrchestratorState) -> str:
+        if state.get("phase") == "team_unavailable":
+            return END
+        return "provision_workspace"
+
     def route_after_preparation(state: OrchestratorState) -> str:
         if state.get("change_request"):
             return "agent_implement"
         return END
 
+    def route_after_agent_verify(state: OrchestratorState):
+        """Route after agent_verify: fan out to agent_qa and review_change in parallel
+        when max_parallel_workers > 1, otherwise proceed sequentially."""
+        max_workers = int(state.get("max_parallel_workers", 1) or 1)
+        if max_workers > 1:
+            return [Send("agent_qa", state), Send("review_change", state)]
+        return "agent_qa"
+
+    def route_after_agent_qa(state: OrchestratorState) -> str:
+        """Route after agent_qa: in parallel mode, go directly to
+        write_verification_result_artifact. In sequential mode, go to review_change."""
+        max_workers = int(state.get("max_parallel_workers", 1) or 1)
+        if max_workers > 1:
+            return "write_verification_result_artifact"
+        return "review_change"
+
     def agent_implement(state: OrchestratorState) -> OrchestratorState:
         """Ask the engineer agent to produce structured edit specifications."""
+        import json
+
         plan = str(state.get("plan_content", ""))
         objective = str(state.get("objective", ""))
         targets = state.get("target_file_previews", [])
@@ -1121,41 +1486,75 @@ Example: [{{"path":"src/main.py","old_text":"return x+y","new_text":"return x+y+
 
 Return ONLY the JSON array, no other text."""
 
-        edits_json = "[]"
-        impl_summary = "Implementation unavailable"
-        try:
-            resp = ask_agent(state, "engineer", prompt)
-            # Extract JSON array from response
-            content = resp.content.strip()
-            if "```" in content:
-                content = content.split("```")[1]
-                if content.startswith("json"):
-                    content = content[4:]
-            content = content.strip()
-            edits_json = content
-            impl_summary = f"Engineer produced edit specifications"
-        except Exception as exc:
-            impl_summary = f"Implementation failed: {exc}"
+        # ask_agent now handles retries internally via task 3.4
+        resp = ask_agent(state, "engineer", prompt)
 
-        # Parse edit specs into structured form for apply_requested_change
-        parsed_edits: list[dict] = []
-        try:
-            import json
-            parsed = json.loads(edits_json)
-            if isinstance(parsed, list):
-                parsed_edits = [
-                    {"path": e.get("path",""), "old_text": e.get("old_text",""),
-                     "new_text": e.get("new_text",""), "rationale": e.get("rationale","")}
-                    for e in parsed if e.get("path") and e.get("old_text")
-                ]
-        except Exception:
-            pass
+        # Extract JSON from response
+        content = resp.content.strip()
+        if "```" in content:
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        content = content.strip()
 
+        # Attempt to parse, with corrective retry on failure
+        max_parse_retries = 2
+        parse_error: str | None = None
+        malformed_output: str = content
+
+        for parse_attempt in range(max_parse_retries + 1):
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, list):
+                    parsed_edits = [
+                        {"path": e.get("path",""), "old_text": e.get("old_text",""),
+                         "new_text": e.get("new_text",""), "rationale": e.get("rationale","")}
+                        for e in parsed if e.get("path") and e.get("old_text")
+                    ]
+                    return {
+                        **state,
+                        "impl_content": "Engineer produced edit specifications",
+                        "parsed_edits": parsed_edits,
+                        "phase": "implemented_by_engineer",
+                    }
+                else:
+                    parse_error = f"Expected JSON array, got {type(parsed).__name__}"
+            except json.JSONDecodeError as exc:
+                parse_error = str(exc)
+
+            # If we haven't exhausted retries, send corrective prompt
+            if parse_attempt < max_parse_retries:
+                corrective_prompt = f"""Your previous response could not be parsed as a JSON array.
+
+PARSE ERROR: {parse_error}
+
+YOUR PREVIOUS OUTPUT (truncated):
+{content[:500]}
+
+Please respond with ONLY a valid JSON array of edit objects. Each object must have:
+- "path": relative file path
+- "old_text": exact text to replace
+- "new_text": replacement text
+- "rationale": why this change
+
+Return ONLY the JSON array, no markdown, no explanation."""
+
+                resp = ask_agent(state, "engineer", corrective_prompt)
+                content = resp.content.strip()
+                if "```" in content:
+                    content = content.split("```")[1]
+                    if content.startswith("json"):
+                        content = content[4:]
+                content = content.strip()
+
+        # All parse retries exhausted
         return {
             **state,
-            "impl_content": impl_summary,
-            "parsed_edits": parsed_edits,
-            "phase": "implemented_by_engineer",
+            "impl_content": f"Implementation parse failed after {max_parse_retries + 1} attempts: {parse_error}",
+            "parsed_edits": [],
+            "status": "failed",
+            "phase": "implementation_parse_failed",
+            "summary": f"Engineer output could not be parsed: {parse_error}. Malformed output: {malformed_output[:200]}",
         }
 
     def agent_verify(state: OrchestratorState) -> OrchestratorState:
@@ -1201,6 +1600,7 @@ Return ONLY the JSON object."""
         }
 
     def apply_requested_change(state: OrchestratorState) -> OrchestratorState:
+        _emit_phase_transition(state, "change_applied", "applying_edits")
         request = state.get("change_request") or {}
         edits = request.get("edits", [])
         # If the engineer produced structured edits, prefer those over the request edits.
@@ -1336,7 +1736,7 @@ Return ONLY the JavaScript code, no explanation."""
 
         qa_result = "QA unavailable"
         try:
-            resp = ask_agent(state, "engineer", prompt)
+            resp = ask_agent(state, "qa", prompt)
             test_script = resp.content.strip()
             if test_script.startswith("```"):
                 test_script = test_script.split("```")[1]
@@ -1424,6 +1824,79 @@ Return ONLY the JavaScript code, no explanation."""
         ]
         commands = requested_commands or candidate_commands[:1]
 
+        task_id = state["task_id"]
+        worktree = state.get("worktree_path", "")
+
+        _emit_phase_transition(state, "verification", "run_verification_start")
+
+        # --- Verification Protocol: select strategy and run properties (Requirement 26.1) ---
+        if verification_protocol and worktree:
+            try:
+                # Determine change type from plan/context
+                change_type = "logic"  # default
+                plan = str(state.get("plan_content", "")).lower()
+                if "documentation" in plan or "readme" in plan:
+                    change_type = "documentation"
+                elif "config" in plan:
+                    change_type = "config"
+                elif "refactor" in plan:
+                    change_type = "refactoring"
+
+                # Get file types from targets
+                file_types = list({
+                    Path(str(t.get("path", ""))).suffix
+                    for t in state.get("target_candidates", [])
+                    if Path(str(t.get("path", ""))).suffix
+                })
+
+                strategy = verification_protocol.select_strategy(
+                    change_type=change_type,
+                    file_types=file_types,
+                    task_id=task_id,
+                )
+
+                # Generate properties from the plan
+                properties = verification_protocol.generate_properties(
+                    plan=str(state.get("plan_content", "")),
+                    target_files=[str(t.get("path", "")) for t in state.get("target_candidates", [])],
+                    language="python" if ".py" in str(file_types) else "typescript",
+                    task_id=task_id,
+                )
+
+                # Execute full verification with the protocol
+                if properties:
+                    vp_result = verification_protocol.run_full_verification(
+                        worktree=str(worktree),
+                        strategy=strategy,
+                        properties=properties,
+                        host_client=host_client,
+                        task_id=task_id,
+                    )
+                    # Convert VP results into verification_runs format
+                    for prop_result in vp_result.property_results:
+                        commands_already_run = True  # VP handled execution
+                        verification_runs: list[dict[str, str | bool | int]] = []
+                        verification_runs.append({
+                            "command": f"property: {prop_result.property_name}",
+                            "success": prop_result.passed,
+                            "summary": prop_result.diagnostic or "passed",
+                            "output": prop_result.output[:500] if prop_result.output else "",
+                        })
+
+                    all_success = vp_result.outcome.value in ("verified_correct", "tests_pass")
+                    return {
+                        **state,
+                        "phase": "verification_passed" if all_success else "verification_failed",
+                        "status": "running" if all_success else "failed",
+                        "summary": f"Verification Protocol: {vp_result.outcome.value} ({len(properties)} properties)",
+                        "verification_runs": verification_runs,
+                        "verification_outcome": "passed" if all_success else "failed",
+                    }
+            except Exception as exc:
+                logger.warning("Verification Protocol failed, falling back to standard: %s", exc)
+                # Fall through to standard verification below
+
+        # Standard verification fallback
         verification_runs: list[dict[str, str | bool | int]] = []
         all_success = True
         for command in commands:
@@ -1485,6 +1958,118 @@ Return ONLY the JavaScript code, no explanation."""
         }
 
     def evaluate_approval_policy(state: OrchestratorState) -> OrchestratorState:
+        task_id = state.get("task_id", "")
+
+        _emit_phase_transition(state, "approval", "evaluate_approval_policy")
+
+        # --- Approval Matrix: evaluate risk and routing (Requirement 30.1) ---
+        if approval_matrix:
+            try:
+                # Build change_context for the approval matrix
+                applied_paths = [
+                    str(edit.get("path", ""))
+                    for edit in state.get("applied_edits", [])
+                    if str(edit.get("path", "")).strip()
+                ]
+                change_context: dict[str, Any] = {
+                    "changed_files": applied_paths,
+                    "files_changed": len(applied_paths),
+                    "lines_changed": sum(
+                        int(edit.get("bytes_written", 0))
+                        for edit in state.get("applied_edits", [])
+                    ),
+                    "repo_path": state.get("repo_path", ""),
+                    "cost_consumed_pct": 0.0,
+                }
+
+                # Get confidence score if available
+                tier = "moderate"  # default
+                if model_router:
+                    try:
+                        target_count = len(state.get("target_candidates", []) or [])
+                        signals = ComplexitySignals(
+                            objective_scope=state.get("objective", ""),
+                            target_file_count=max(target_count, 1),
+                            repo_size_files=len(state.get("repo_top_level_entries", []) or []),
+                            language_count=1,
+                            change_type="logic",
+                            security_relevant=False,
+                            test_modification=False,
+                        )
+                        tier = model_router.classify_complexity(signals).value
+                    except Exception:
+                        pass
+
+                confidence = approval_matrix.get_confidence(
+                    tier=tier,
+                    repo=state.get("repo_path", ""),
+                )
+                change_context["confidence_score"] = confidence.score
+
+                # Get cost consumed percentage
+                if cost_client and state.get("max_cost_usd"):
+                    try:
+                        cumulative = cost_client.get_task_cost(task_id)
+                        change_context["cost_consumed_pct"] = cumulative / float(state["max_cost_usd"])
+                    except Exception:
+                        pass
+
+                # Classify risk
+                risk = approval_matrix.classify_risk([
+                    {"signal": "files_changed", "value": str(len(applied_paths))},
+                    {"signal": "verification_outcome", "value": str(state.get("verification_outcome", ""))},
+                ])
+                change_context["risk_level"] = risk.level
+
+                # Evaluate through matrix
+                matrix_decision = approval_matrix.evaluate(change_context)
+
+                # Map matrix routing to workflow routing
+                route_map = {
+                    "auto_approve": "auto_complete",
+                    "founder_review": "founder_review",
+                    "escalate_and_halt": "stop",
+                }
+                mapped_route = route_map.get(matrix_decision.routing, "founder_review")
+
+                # --- Execution Trace: record approval evaluation (Requirement 6.1) ---
+                if execution_trace:
+                    try:
+                        execution_trace.record_decision(
+                            task_id=task_id,
+                            decision_type="approval_routing",
+                            state_snapshot={
+                                "risk_level": risk.level,
+                                "matched_rule": matrix_decision.matched_rule_name,
+                                "confidence_score": confidence.score,
+                                "files_changed": len(applied_paths),
+                            },
+                            policy=f"approval_matrix.rule:{matrix_decision.matched_rule_name or 'default'}",
+                            outcome=mapped_route,
+                        )
+                    except Exception:
+                        pass
+
+                # Build compatible ApprovalPolicyDecision
+                reasons = [matrix_decision.reason]
+                if risk.level in ("high", "critical"):
+                    reasons.append(f"risk classified as {risk.level}")
+                verification_outcome = str(state.get("verification_outcome", "")).strip()
+                options = approval_options_for_route_internal(mapped_route, verification_outcome)
+
+                return {
+                    **state,
+                    "approval_risk": risk.level,
+                    "approval_route": mapped_route,
+                    "approval_reasons": reasons,
+                    "approval_summary": matrix_decision.reason,
+                    "approval_options": options,
+                }
+            except Exception as exc:
+                logger.warning("Approval Matrix evaluation failed, falling back to policy: %s", exc)
+                # Fall through to legacy policy
+
+        # Fallback to existing policy logic
         decision: ApprovalPolicyDecision = decide_approval_policy(state)
         updated = {
             **state,
@@ -1496,6 +2081,23 @@ Return ONLY the JavaScript code, no explanation."""
         }
         if decision.route == "stop":
             updated["summary"] = decision.summary
+
+        # --- Execution Trace: record fallback approval evaluation ---
+        if execution_trace and task_id:
+            try:
+                execution_trace.record_decision(
+                    task_id=task_id,
+                    decision_type="approval_routing",
+                    state_snapshot={
+                        "risk_class": decision.risk_class,
+                        "route": decision.route,
+                    },
+                    policy="policy.decide_approval_policy",
+                    outcome=decision.route,
+                )
+            except Exception:
+                pass
+
         return updated
 
     def route_after_approval_policy(state: OrchestratorState) -> str:
@@ -1505,6 +2107,15 @@ Return ONLY the JavaScript code, no explanation."""
         if route == "auto_complete":
             return "finalize_without_review"
         return END
+
+    def approval_options_for_route_internal(route: str, verification_outcome: str) -> list[str]:
+        """Build approval options list for the given route."""
+        if route != "founder_review":
+            return []
+        options = ["approve", "reject", "clarify"]
+        if verification_outcome != "failed":
+            options.insert(1, "edit_and_approve")
+        return options
 
     def finalize_without_review(state: OrchestratorState) -> OrchestratorState:
         summary = str(state.get("approval_summary", "")).strip()
@@ -1630,6 +2241,39 @@ Return ONLY the JavaScript code, no explanation."""
         summary = "Founder rejected the change"
         if comment:
             summary += f": {comment}"
+
+        _emit_phase_transition(state, "founder_rejected", "founder_decision_reject")
+
+        # --- Approval Matrix: decrement confidence on rejection ---
+        if approval_matrix and state.get("repo_path"):
+            try:
+                tier = "moderate"
+                if model_router:
+                    target_count = len(state.get("target_candidates", []) or [])
+                    signals = ComplexitySignals(
+                        objective_scope=state.get("objective", ""),
+                        target_file_count=max(target_count, 1),
+                        repo_size_files=len(state.get("repo_top_level_entries", []) or []),
+                        language_count=1,
+                        change_type="logic",
+                        security_relevant=False,
+                        test_modification=False,
+                    )
+                    tier = model_router.classify_complexity(signals).value
+                approval_matrix.decrement_confidence(tier=tier, repo=state["repo_path"])
+            except Exception:
+                pass
+
+        # --- Knowledge Store: record failure for learning ---
+        if knowledge_store and state.get("repo_path") and state.get("task_id"):
+            try:
+                knowledge_store.extract_from_task(
+                    task_id=state["task_id"],
+                    repo_path=state["repo_path"],
+                    outcome="failure",
+                )
+            except Exception:
+                pass
 
         # Rollback the worktree to the pre-edit snapshot.
         worktree_path = state.get("worktree_path", "")
@@ -1870,7 +2514,43 @@ Return ONLY the JavaScript code, no explanation."""
 
     def finalize_merge_readiness(state: OrchestratorState) -> OrchestratorState:
         summary = str(state.get("summary", state.get("merge_summary", ""))).strip()
+        task_id = state.get("task_id", "")
+        repo_path = state.get("repo_path", "")
+
         if state.get("merge_readiness") == "ready":
+            _emit_phase_transition(state, "merge_ready", "merge_readiness_confirmed")
+
+            # --- Knowledge Store: record outcome for learning (Requirement 38.3) ---
+            if knowledge_store and repo_path and task_id:
+                try:
+                    knowledge_store.extract_from_task(
+                        task_id=task_id,
+                        repo_path=repo_path,
+                        outcome="success",
+                    )
+                except Exception:
+                    pass
+
+            # --- Approval Matrix: increment confidence on success ---
+            if approval_matrix and repo_path:
+                try:
+                    tier = "moderate"
+                    if model_router:
+                        target_count = len(state.get("target_candidates", []) or [])
+                        signals = ComplexitySignals(
+                            objective_scope=state.get("objective", ""),
+                            target_file_count=max(target_count, 1),
+                            repo_size_files=len(state.get("repo_top_level_entries", []) or []),
+                            language_count=1,
+                            change_type="logic",
+                            security_relevant=False,
+                            test_modification=False,
+                        )
+                        tier = model_router.classify_complexity(signals).value
+                    approval_matrix.increment_confidence(tier=tier, repo=repo_path)
+                except Exception:
+                    pass
+
             updated = {
                 **state,
                 "status": "completed",
@@ -1882,6 +2562,9 @@ Return ONLY the JavaScript code, no explanation."""
                 "merge_ready",
                 format_operator_state_notification(updated, "merge_ready"),
             )
+
+        _emit_phase_transition(state, "merge_blocked", "merge_readiness_blocked")
+
         updated = {
             **state,
             "status": "paused",
@@ -1939,7 +2622,7 @@ Return ONLY the JavaScript code, no explanation."""
     builder.add_node("finalize_merge_readiness", finalize_merge_readiness)
     builder.add_edge(START, "verify_host")
     builder.add_edge("verify_host", "discover_team")
-    builder.add_edge("discover_team", "provision_workspace")
+    builder.add_conditional_edges("discover_team", route_after_discover_team)
     builder.add_edge("provision_workspace", "create_worktree")
     builder.add_edge("create_worktree", "inspect_repo")
     builder.add_edge("inspect_repo", "discover_targets")
@@ -1956,8 +2639,16 @@ Return ONLY the JavaScript code, no explanation."""
     builder.add_edge("apply_requested_change", "write_change_artifact")
     builder.add_edge("write_change_artifact", "run_verification")
     builder.add_edge("run_verification", "agent_verify")
-    builder.add_edge("agent_verify", "agent_qa")
-    builder.add_edge("agent_qa", "review_change")
+    builder.add_conditional_edges(
+        "agent_verify",
+        route_after_agent_verify,
+        ["agent_qa", "review_change"],
+    )
+    builder.add_conditional_edges(
+        "agent_qa",
+        route_after_agent_qa,
+        ["write_verification_result_artifact", "review_change"],
+    )
     builder.add_edge("review_change", "write_verification_result_artifact")
     builder.add_edge("write_verification_result_artifact", "evaluate_approval_policy")
     builder.add_conditional_edges("evaluate_approval_policy", route_after_approval_policy)
