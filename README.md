@@ -311,6 +311,8 @@ rules:
 
 ## Multi-Channel Access
 
+**Core channels** (maintained, tested, supported):
+
 | Channel | Use Case |
 |---------|----------|
 | **CLI** | Interactive terminal or single-shot commands |
@@ -318,6 +320,10 @@ rules:
 | **REST API** | Integrate with CI/CD, issue trackers, or custom tooling |
 | **WebSocket** | Real-time streaming for custom UIs |
 | **Founder Console** | Web dashboard for full platform management |
+
+**Community channels** (`contrib/channels/` — community-maintained, no SLA):
+
+Discord, Slack, DingTalk, Feishu, Line, QQ, OneBot, MaixCam. These adapters are contributed by the community and work but are not part of the core test suite. PRs welcome.
 
 ## Project Structure
 
