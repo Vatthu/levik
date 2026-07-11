@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
   "fastapi==0.136.1",
   "httpx==0.28.1",
-  "langgraph==1.1.9",
+  "langgraph==1.2.9",
   "langgraph-checkpoint-sqlite==3.0.3",
   "pydantic==2.13.3",
   "pydantic-settings>=2.14.2",
