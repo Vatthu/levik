@@ -81,3 +81,6 @@ web/dist/
 
 # Kiro specs (internal engineering process)
 .kiro/
+
+# Local scripts (release checks, utilities)
+scripts/
