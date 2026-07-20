@@ -5,7 +5,7 @@ description = "Python orchestration service for Vikram"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "fastapi==0.136.1",
+  "fastapi==0.139.2",
   "httpx==0.28.1",
   "langgraph==1.1.9",
   "langgraph-checkpoint-sqlite==3.0.3",
